@@ -1,57 +1,111 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-$|=1;
-use IPTables::Parse;
-use Text::Table::Any;
-use Data::Dumper;
-my $table = shift @ARGV || 'filter';
 
-my %columns;
-my @column_names = (qw(num int out src dest state target extended comment));
-for (my $i = 0; $i < @column_names; $i++) {
-  $columns{$column_names[$i]} = $i;
+# sudo iptables -L -n -v --line-numbers|./ipls.pl -
+
+use IPTables::Parse;
+use Text::Table::Tiny qw/generate_table/;
+$Text::Table::Tiny::HEADER_CORNER_MARKER = '+';
+$Text::Table::Tiny::HEADER_ROW_SEPARATOR = '-';
+our ($temp, $table);
+
+if ((defined $ARGV[0]) && ($ARGV[0] eq '-')) {
+my $input = do {local $/; <>};
+    use File::Temp;
+    $temp  = File::Temp->new(TEMPLATE =>'iptablesXXXXXX');
+    print $temp $input;
+}
+else {
+$table = shift @ARGV;
+}
+
+$table ||= 'filter';
+
+our @column_names = (qw(num int out prot src dest state target extended comment));
+
+sub any (&@) {
+  my $f = shift;
+  for (@_) {
+    return 1 if $f->();
+  }
+  return 0;
+}
+
+sub process_rule {
+  my $rule = shift;
+  my $int = ($rule->{intf_in} eq '*') ? '' : $rule->{intf_in};
+  my $ext = ($rule->{intf_out} eq '*') ? '' : $rule->{intf_out};
+  my $source = ($rule->{src} eq '0.0.0.0/0') ? '' : $rule->{src};
+  $source .= ":".$rule->{s_port} if $rule->{s_port};
+  my $dest = ($rule->{dst} eq '0.0.0.0/0') ? '' : $rule->{dst};
+  $dest .= ":".$rule->{d_port} if $rule->{d_port};
+  my $prot = ($rule->{protocol} eq 'all') ? '' : $rule->{protocol};
+  my $state = $rule->{state};
+  my $extended = $rule->{extended};
+  my @res = (qr/^\s+/, qr/\s+$/);
+  unshift @res, qr/\bstate $state\b/ if $state;
+  unshift @res, qr/\breject-with icmp-port-unreachable\b/ if ($rule->{target} eq 'REJECT') && $prot && ($prot ne 'icmp');
+  if ($rule->{d_port}) {
+    my $dstr = join '', 'dpt', (($rule->{d_port} =~ /:/) ? 's' : ''), ':', $rule->{d_port};
+    my $re = qr/\b$rule->{protocol}\s+$dstr\b/;
+    unshift @res, $re;
+  }
+  $extended =~ s{$_}{} for @res;
+  $extended =~ s{\s+}{ }g;
+  return [$rule->{rule_num}, $int, $ext, $prot, $source, $dest, $state, $rule->{target},$extended,$rule->{comment}];
+}
+
+sub assign {
+  my ($columns,$listref) = @_;
+  for (my $i=0; $i < @$listref; $i++) {
+    push @{$columns->{$column_names[$i]}}, $listref->[$i];
+  }
 }
 
 sub process_chain {
   my $rules = shift;
-  my @result;
+  my %columns;
+  $columns{$_} = [] for @column_names;
+
+
   for my $rule (@$rules) {
-    push @result, [$rule->{rule_num}, $rule->{intf_in}, (($rule->{intf_out} eq '*') ? '' : $rule->{intf_out}), (join ':', $rule->{src}, $rule->{s_port}), (join ':', $rule->{dst}, $rule->{d_port}), $rule->{state}, $rule->{target}, $rule->{extended}, $rule->{comment}]
+    assign(\%columns,process_rule($rule));
   }
-  # construct a column centric view, keeping columns iff one is non-blank, turn it back into a row-centric view at the end
-  my @include;
-  COL: for (my $i = 0; $i < @column_names; $i++) {
-    for my $row (@result) {
-      if (defined $row->[$i] and $row->[$i] =~ /\S/) {
-        $include[$i] = $i;
-        next COL;
-      }
-    }
+  my $matrix = [];
+
+  for my $column (@column_names) {
+    push @$matrix, [ $column, @{$columns{$column}} ] if (any { defined $_ and $_ =~ /\S/ } @{$columns{$column}});
   }
-  my %diff;
-  @diff{values %columns} = (1) x scalar @column_names;
-  delete @diff{@include};
-my  @exclude = reverse sort keys %diff;
-  unshift @result, \@column_names;
-  my @real;
-  for my $i (@exclude) {
-    for (my $j =0; $j < @result; $j++) {
-      splice @{$result[$j]}, $i, 1;
-    }
+  return undef unless scalar @$matrix;
+  my @transposed;
+  my $lc = $#{$matrix->[0]};
+  for my $col (0..$lc) {
+    push @transposed, [map $_->[$col], @$matrix];
   }
-  return \@result;
+  return \@transposed;
+
 }
 
-die "Must be root" if $<;
+my %opt;
+if ($temp) {
+    $opt{ipt_rules_file} = $temp;
+}
+elsif ($<) {
+    die "Must be run as root\n";
+}    
+my $ipt = IPTables::Parse->new(%opt);
 
-my $ipt = IPTables::Parse->new;
 my $chains = $ipt->list_table_chains($table);
 
+my @output;
 for my $chain (@$chains) {
-    my $rules = $ipt->chain_rules($table, $chain);
-    print "$chain\n"; # policy
-    my $rows = process_chain($rules);
-    print +(scalar @{$rows->[0]}) ? Text::Table::Any::table(rows => process_chain($rules), header_row => 1) : "No rules\n";
-  }
-  
+  my $rules = $ipt->chain_rules($table, $chain);
+  my $policy = $ipt->chain_policy($table, $chain);
+  $chain = join ' ', $chain, "(policy: $policy)" if $policy;
+  push @output, $chain;
+  my $rows = process_chain($rules);
+  push @output, +(defined $rows) ? generate_table(rows => process_chain($rules), header_row => 1, separate_rows => 1) : "No rules";
+  push @output, '';
+}
+print join  "\n", @output;
