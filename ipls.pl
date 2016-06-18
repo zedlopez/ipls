@@ -1,36 +1,28 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-
+use Data::Dumper;
 # sudo iptables -L -n -v --line-numbers|./ipls.pl -
-
+use List::Util qw/any/;
+use lib "/home/zed/github/IPTables-Parse/lib";
 use IPTables::Parse;
-use Text::Table::Tiny qw/generate_table/;
-$Text::Table::Tiny::HEADER_CORNER_MARKER = '+';
-$Text::Table::Tiny::HEADER_ROW_SEPARATOR = '-';
-our ($temp, $table);
+
+use first 'Text::ANSITable', 'Text::ASCIITable', 'Text::Table::Tiny';
+# TODO: die if it doesn't find one?
+my $tableclass = $first::module;
+
+our ($table, $input);
 
 if ((defined $ARGV[0]) && ($ARGV[0] eq '-')) {
-my $input = do {local $/; <>};
-    use File::Temp;
-    $temp  = File::Temp->new(TEMPLATE =>'iptablesXXXXXX');
-    print $temp $input;
-}
-else {
-$table = shift @ARGV;
+  $input = do {local $/; <>};
+} else {
+  $table = shift @ARGV;
 }
 
 $table ||= 'filter';
 
-our @column_names = (qw(num int out prot src dest state target extended comment));
-
-sub any (&@) {
-  my $f = shift;
-  for (@_) {
-    return 1 if $f->();
-  }
-  return 0;
-}
+our @column_names = (qw(int out prot src dest state target extended comment));
+unshift @column_names, '#';
 
 sub process_rule {
   my $rule = shift;
@@ -88,24 +80,66 @@ sub process_chain {
 }
 
 my %opt;
-if ($temp) {
-    $opt{ipt_rules_file} = $temp;
+if ($input) {
+  $opt{ipt_rules} = $input;
+} elsif ($<) {
+  die "Must be run as root\n";
 }
-elsif ($<) {
-    die "Must be run as root\n";
-}    
+
 my $ipt = IPTables::Parse->new(%opt);
 
 my $chains = $ipt->list_table_chains($table);
 
 my @output;
 for my $chain (@$chains) {
+  #  print "$chain";
+  #  print Dumper(\@output);
   my $rules = $ipt->chain_rules($table, $chain);
   my $policy = $ipt->chain_policy($table, $chain);
   $chain = join ' ', $chain, "(policy: $policy)" if $policy;
-  push @output, $chain;
   my $rows = process_chain($rules);
-  push @output, +(defined $rows) ? generate_table(rows => process_chain($rules), header_row => 1, separate_rows => 1) : "No rules";
-  push @output, '';
+  if ($tableclass eq 'Text::Table::Tiny') {
+    {
+      no warnings 'once';
+      $Text::Table::Tiny::HEADER_CORNER_MARKER = '+';
+      $Text::Table::Tiny::HEADER_ROW_SEPARATOR = '-';
+    }
+    push @output, $chain;
+    push @output, ((defined $rows) ? Text::Table::Tiny::generate_table(rows => $rows, header_row => 1, separate_rows => 1) : "No rules"), '';
+    next;
+  }
+  binmode(STDOUT, ":utf8");
+  my $columns = shift @$rows;
+  #  print Dumper($columns);
+  my $t;
+  if ($tableclass eq 'Text::ASCIITable') {
+    if (@$rows) {
+      $t = Text::ASCIITable->new({headingText => $chain, headingAlign => 'left'});
+      $t->setCols($columns);
+      $t->addRow($rows);
+    } else {
+      $t =Text::ASCIITable->new;
+      $t->setCols([$chain]);
+      $t->addRow(["No rules"]);
+    }
+    push @output, $t->draw, '';
+  }
+  else { #Text::ANSITable
+    if (@$rows) {
+      $t = Text::ANSITable->new;
+      $t->use_utf8(1);
+      $t->use_box_chars(1);
+      $t->border_style('Default::csingle');
+      $t->apply_style_set(AltRow => {even_bgcolor => '333333'}); # TODO doesn't work
+      $t->show_row_separator(1);
+      $t->columns($columns);
+      $t->set_column_style($_, align => 'right') for @{$t->columns};
+      $t->rows($rows);
+      push @output, $t->draw, '';
+    } else {
+      push @output, $chain, 'No rules', '';
+    }
+  }
 }
 print join  "\n", @output;
+
